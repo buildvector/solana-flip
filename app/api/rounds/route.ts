@@ -1,4 +1,5 @@
 // app/api/rounds/route.ts
+
 import { NextResponse } from 'next/server';
 import {
   Connection,
@@ -9,67 +10,25 @@ import {
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import crypto from 'crypto';
+import { redis } from '@/lib/redis';
 
 export const runtime = 'nodejs';
 
-/* ================= TYPES ================= */
+/* ================= CONFIG ================= */
 
-type FlipStatus = 'created' | 'joined' | 'resolved';
-
-type Reservation = {
-  token: string;
-  joiner: string;
-  expiresAt: number;
-};
-
-type FlipRound = {
-  id: string;
-  createdAt: number;
-  betSol: number;
-  creator: string;
-  joiner?: string;
-  status: FlipStatus;
-  winner?: string;
-  signature?: string;
-  joinSig?: string;
-  resolveSig?: string;
-  reservation?: Reservation;
-};
-
-/* ================= MEMORY STORE ================= */
-
-type Store = {
-  rounds: Map<string, FlipRound>;
-  usedSigs: Set<string>;
-};
-
-const STORE_KEY = '__SOLANA_FLIP_STORE__';
-
-function store(): Store {
-  // @ts-ignore
-  if (!globalThis[STORE_KEY]) {
-    // @ts-ignore
-    globalThis[STORE_KEY] = {
-      rounds: new Map<string, FlipRound>(),
-      usedSigs: new Set<string>(),
-    };
-  }
-  // @ts-ignore
-  return globalThis[STORE_KEY];
-}
-
-/* ================= HELPERS ================= */
+const PLAY_FEE_BPS = 300;
+const RESERVATION_MS = 30_000;
 
 function now() {
   return Date.now();
 }
 
 function jsonOk(data: any) {
-  return NextResponse.json(data, { status: 200 });
+  return NextResponse.json(data);
 }
 
-function jsonErr(error: string, status = 400, extra?: any) {
-  return NextResponse.json({ error, ...(extra || {}) }, { status });
+function jsonErr(error: string, status = 400) {
+  return NextResponse.json({ error }, { status });
 }
 
 function makeId(prefix = 'mle') {
@@ -78,52 +37,6 @@ function makeId(prefix = 'mle') {
     .slice(2, 8)}`;
 }
 
-/* ================= CONFIG ================= */
-
-const PLAY_FEE_BPS = 300;
-const MIN_TREASURY_BUFFER_LAMPORTS = Math.round(0.001 * LAMPORTS_PER_SOL);
-const RESERVATION_MS = 30_000;
-
-/* ================= RPC ================= */
-
-function getRpcUrl() {
-  return process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-}
-
-function getTreasuryKeypair(): Keypair {
-  const raw = process.env.TREASURY_SECRET_KEY;
-  if (!raw) throw new Error('Missing TREASURY_SECRET_KEY');
-
-  const arr = JSON.parse(raw);
-  return Keypair.fromSecretKey(Uint8Array.from(arr));
-}
-
-/* ================= SELF HEAL CLEANER ================= */
-
-function cleanReservation(r: FlipRound): FlipRound {
-  if (r.reservation && r.reservation.expiresAt <= now()) {
-    const cleaned = { ...r };
-    delete cleaned.reservation;
-    store().rounds.set(r.id, cleaned);
-    return cleaned;
-  }
-  return r;
-}
-
-function cleanAllReservations() {
-  const s = store();
-  const t = now();
-  for (const [id, r] of s.rounds.entries()) {
-    if (r.reservation && r.reservation.expiresAt <= t) {
-      const cleaned = { ...r };
-      delete cleaned.reservation;
-      s.rounds.set(id, cleaned);
-    }
-  }
-}
-
-/* ================= SPLITS ================= */
-
 function computeSplits(betSol: number) {
   const betLamports = Math.round(betSol * LAMPORTS_PER_SOL);
   const feeLamports = Math.max(1, Math.floor((betLamports * PLAY_FEE_BPS) / 10_000));
@@ -131,49 +44,20 @@ function computeSplits(betSol: number) {
   return { betLamports, potLamports };
 }
 
-/* ================= WINNER ================= */
-
 function pickWinner(createSig: string, joinSig: string, creator: string, joiner: string) {
   const hash = crypto.createHash('sha256').update(`${createSig}:${joinSig}`).digest();
   const bit = hash[hash.length - 1] % 2;
   return bit === 0 ? creator : joiner;
 }
 
-/* ================= RESOLVE ================= */
+function getRpcUrl() {
+  return process.env.RPC_URL!;
+}
 
-async function tryResolve(id: string) {
-  const s = store();
-  const r = s.rounds.get(id);
-  if (!r) return null;
-  if (r.status !== 'joined') return r;
-
-  const treasury = getTreasuryKeypair();
-  const connection = new Connection(getRpcUrl(), 'confirmed');
-
-  const { potLamports } = computeSplits(r.betSol);
-  const payout = potLamports * 2;
-
-  const winner = pickWinner(r.signature!, r.joinSig!, r.creator, r.joiner!);
-  const tx = new Transaction().add(
-    SystemProgram.transfer({
-      fromPubkey: treasury.publicKey,
-      toPubkey: new PublicKey(winner),
-      lamports: payout,
-    })
-  );
-
-  const sig = await connection.sendTransaction(tx, [treasury]);
-  await connection.confirmTransaction(sig, 'confirmed');
-
-  const resolved: FlipRound = {
-    ...r,
-    status: 'resolved',
-    winner,
-    resolveSig: sig,
-  };
-
-  s.rounds.set(id, resolved);
-  return resolved;
+function getTreasuryKeypair(): Keypair {
+  const raw = process.env.TREASURY_SECRET_KEY!;
+  const arr = JSON.parse(raw);
+  return Keypair.fromSecretKey(Uint8Array.from(arr));
 }
 
 /* ================= ROUTE ================= */
@@ -182,12 +66,16 @@ export async function POST(req: Request) {
   try {
     const body = await req.json();
     const action = body?.action;
-    const s = store();
-    cleanAllReservations();
+
+    const treasury = getTreasuryKeypair();
+    const connection = new Connection(getRpcUrl(), 'confirmed');
+
+    /* ================= CREATE ================= */
 
     if (action === 'create') {
       const id = makeId();
-      const round: FlipRound = {
+
+      const round = {
         id,
         createdAt: now(),
         betSol: body.betSol,
@@ -195,70 +83,121 @@ export async function POST(req: Request) {
         status: 'created',
         signature: body.signature,
       };
-      s.rounds.set(id, round);
+
+      await redis.set(`flip:${id}`, round);
+      await redis.zadd('flips:created', { score: round.createdAt, member: id });
+
       return jsonOk({ round });
     }
 
+    /* ================= LIST ================= */
+
     if (action === 'list') {
-      const rounds = Array.from(s.rounds.values())
-        .map(cleanReservation)
-        .sort((a, b) => b.createdAt - a.createdAt);
+      const ids = (await redis.zrange('flips:created', 0, -1, { rev: true })) as string[];
+    
+      const rounds: any[] = [];
+    
+      for (const id of ids) {
+        const r = (await redis.get(`flip:${id}`)) as any;
+        if (r && r.status === 'created') {
+          rounds.push(r);
+        }
+      }
+    
       return jsonOk({ rounds });
     }
+    
+    
+
+    /* ================= GET ================= */
 
     if (action === 'get') {
-      const r = s.rounds.get(body.id);
+      const r = await redis.get(`flip:${body.id}`);
       if (!r) return jsonErr('Not found', 404);
-      return jsonOk({ round: cleanReservation(r) });
+      return jsonOk({ round: r });
     }
 
+    /* ================= RESERVE ================= */
+
     if (action === 'reserveJoin') {
-      const r = s.rounds.get(body.id);
+      const r: any = await redis.get(`flip:${body.id}`);
       if (!r) return jsonErr('Not found', 404);
+      if (r.status !== 'created') return jsonErr('Cannot reserve');
 
-      const round = cleanReservation(r);
-      if (round.status !== 'created') return jsonErr('Cannot reserve');
+      const existing = await redis.get(`reservation:${body.id}`);
+      if (existing) return jsonErr('Already reserved', 409);
 
-      if (round.reservation)
-        return jsonErr('Already reserved', 409, { reservation: round.reservation });
-
-      const reservation: Reservation = {
+      const reservation = {
         token: makeId('rsv'),
         joiner: body.joiner,
         expiresAt: now() + RESERVATION_MS,
       };
 
-      const updated = { ...round, reservation };
-      s.rounds.set(round.id, updated);
+      await redis.set(`reservation:${body.id}`, reservation, {
+        ex: RESERVATION_MS / 1000,
+      });
 
-      return jsonOk({ reservation, round: updated });
+      return jsonOk({ reservation, round: r });
     }
 
+    /* ================= JOIN ================= */
+
     if (action === 'join') {
-      const r = s.rounds.get(body.id);
+      const r: any = await redis.get(`flip:${body.id}`);
       if (!r) return jsonErr('Not found', 404);
 
-      const round = cleanReservation(r);
-      if (!round.reservation) return jsonErr('No reservation');
-      if (round.reservation.token !== body.reservationToken)
-        return jsonErr('Bad reservation');
+      const reservation: any = await redis.get(`reservation:${body.id}`);
+      if (!reservation) return jsonErr('Reservation expired');
+      if (reservation.token !== body.reservationToken)
+        return jsonErr('Bad reservation token');
 
-      const joined: FlipRound = {
-        ...round,
+      const joined = {
+        ...r,
         status: 'joined',
         joiner: body.joiner,
         joinSig: body.signature,
       };
 
-      delete joined.reservation;
-      s.rounds.set(round.id, joined);
+      await redis.set(`flip:${body.id}`, joined);
+      await redis.del(`reservation:${body.id}`);
 
-      const resolved = await tryResolve(round.id);
+      /* ================= RESOLVE ================= */
+
+      const { potLamports } = computeSplits(joined.betSol);
+      const payout = potLamports * 2;
+
+      const winner = pickWinner(
+        joined.signature,
+        joined.joinSig,
+        joined.creator,
+        joined.joiner
+      );
+
+      const tx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: treasury.publicKey,
+          toPubkey: new PublicKey(winner),
+          lamports: payout,
+        })
+      );
+
+      const sig = await connection.sendTransaction(tx, [treasury]);
+      await connection.confirmTransaction(sig, 'confirmed');
+
+      const resolved = {
+        ...joined,
+        status: 'resolved',
+        winner,
+        resolveSig: sig,
+      };
+
+      await redis.set(`flip:${body.id}`, resolved);
+
       return jsonOk({ round: resolved });
     }
 
     return jsonErr('Unknown action');
   } catch (e: any) {
-    return jsonErr(e?.message || 'Server error', 500);
+    return jsonErr(e.message || 'Server error', 500);
   }
 }
