@@ -2,8 +2,28 @@
 
 import { Card, Button, Pill, Label, Hint, Mono } from './ui';
 
+export type FlipStatus = 'created' | 'joined' | 'resolved';
+
+export type Reservation = {
+  token: string;
+  joiner: string;
+  expiresAt: number;
+};
+
+export type FlipRound = {
+  id: string;
+  createdAt: number;
+  betSol: number;
+  creator: string;
+  joiner?: string;
+  status: FlipStatus;
+  winner?: string;
+  resolveSig?: string;
+  reservation?: Reservation;
+};
+
 export default function LobbyCard(props: {
-  round: any;
+  round: FlipRound;
   joining: boolean;
   canJoin: boolean;
   onJoin: () => void;
