@@ -85,29 +85,46 @@ export async function POST(req: Request) {
       };
 
       await redis.set(`flip:${id}`, round);
-      await redis.zadd('flips:created', { score: round.createdAt, member: id });
+
+      // Lobby
+      await redis.zadd('flips:created', {
+        score: round.createdAt,
+        member: id,
+      });
+
+      // History
+      await redis.zadd('flips:all', {
+        score: round.createdAt,
+        member: id,
+      });
 
       return jsonOk({ round });
     }
 
-    /* ================= LIST ================= */
+    /* ================= LIST (LOBBY + HISTORY) ================= */
 
-    if (action === 'list') {
-      const ids = (await redis.zrange('flips:created', 0, -1, { rev: true })) as string[];
-    
-      const rounds: any[] = [];
-    
-      for (const id of ids) {
-        const r = (await redis.get(`flip:${id}`)) as any;
-        if (r && r.status === 'created') {
-          rounds.push(r);
-        }
-      }
-    
-      return jsonOk({ rounds });
-    }
-    
-    
+if (action === 'list') {
+  const only = body?.only as string | undefined;
+
+  let key = 'flips:all';
+  if (only === 'created') key = 'flips:created';
+
+  const ids = await redis.zrange(key, 0, -1, { rev: true });
+
+  const rounds: any[] = [];
+
+  for (const id of ids) {
+    const r = (await redis.get(`flip:${id}`)) as any; // ✅ TS fix
+    if (!r) continue;
+
+    if (only && r.status !== only) continue;
+
+    rounds.push(r);
+  }
+
+  return jsonOk({ rounds });
+}
+
 
     /* ================= GET ================= */
 
@@ -148,6 +165,7 @@ export async function POST(req: Request) {
 
       const reservation: any = await redis.get(`reservation:${body.id}`);
       if (!reservation) return jsonErr('Reservation expired');
+
       if (reservation.token !== body.reservationToken)
         return jsonErr('Bad reservation token');
 
@@ -160,6 +178,9 @@ export async function POST(req: Request) {
 
       await redis.set(`flip:${body.id}`, joined);
       await redis.del(`reservation:${body.id}`);
+
+      // Remove from lobby
+      await redis.zrem('flips:created', body.id);
 
       /* ================= RESOLVE ================= */
 
