@@ -6,6 +6,10 @@ Minimal P2P coin flip built on Solana.
 
 https://filponsol.vercel.app/
 
+## Preview
+
+![Solana Flip Screenshot](./screenshot.png)
+
 ---
 
 ## Overview
