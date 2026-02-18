@@ -8,7 +8,7 @@ https://filponsol.vercel.app/
 
 ## Preview
 
-![Solana Flip Screenshot](/screenshot.png)
+![Solana Flip Screenshot](Screenshot.png)
 
 ---
 
